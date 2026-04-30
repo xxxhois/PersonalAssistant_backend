@@ -19,7 +19,8 @@ services:
     image: chromadb/chroma:latest
     container_name: pa-chroma
     ports:
-      - "8000:8000"
+      # Keep host port 8001 free for the backend dev server on 8000.
+      - "8001:8000"
     volumes:
       - chroma_data:/chroma/chroma
     networks:

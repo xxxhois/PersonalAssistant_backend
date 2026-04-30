@@ -35,6 +35,7 @@ class LLMClient:
         user_context: UserContext,
         memory_chunks: Optional[list[str]] = None,
         task_type: str = "general",
+        custom_system_prompt: Optional[str] = None,
     ) -> AsyncIterator[str]:
         try:
             llm_request = self.prompt_builder.build_chat_request(
@@ -42,6 +43,7 @@ class LLMClient:
                 user_context=user_context,
                 memory_chunks=memory_chunks,
                 task_type=task_type,
+                custom_system_prompt=custom_system_prompt,
             )
 
             async for token in self.llm_adapter.stream(llm_request):

@@ -14,7 +14,8 @@ class MemoryChunk(BaseModel):
 class MemoryPort(Protocol):
     """
     异构记忆访问接口 (MemoryPort)
-    遵循架构铁律：PG 为真相源，向量库仅为检索加速缓存
+    Architecture rule: durable memory data lives in PG. Vector databases such as
+    Chroma are retrieval indexes only and must be hydrated or reconciled against PG.
     """
     async def query_context(
         self, 

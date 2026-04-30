@@ -7,6 +7,7 @@ from src.core.ports.memory_port import MemoryPort
 from src.core.prompts.prompt_builder import PromptBuilder
 from src.core.prompts.dynamic_prompts import UserContext
 from src.services.llm_client import LLMClient
+from src.services.companion import CompanionService
 from src.parsers.shadow_parser import ShadowParser
 from src.schemas.sse import SSEFrame, SSEEventType
 from src.schemas.htn import JsonValue
@@ -40,6 +41,10 @@ class Orchestrator:
             llm_adapter=llm_port,
             prompt_builder=self.prompt_builder
         )
+        self.companion_service = CompanionService(
+            llm_client=self.llm_client,
+            memory_port=memory_port,
+        )
 
     async def chat_stream(
         self, 
@@ -59,22 +64,10 @@ class Orchestrator:
         seq = 0
 
         try:
-            # 步骤 1：构建用户上下文
-            user_context = await self._build_user_context(user_id)
-            
-            # 步骤 2：检索记忆上下文
-            memory_chunks = await self._retrieve_memory_context(user_input)
-            
-            # 步骤 3：分析用户意图（用于优化 Prompt）
-            task_type = await self._analyze_intent(user_input)
-            
-            # 步骤 4-5：通过 LLMClient 调用 LLM
-            # LLMClient 自动处理：Prompt 构建、参数验证、流式调用
-            async for chunk in self.llm_client.chat_stream(
-                user_message=user_input,
-                user_context=user_context,
-                memory_chunks=memory_chunks,
-                task_type=task_type
+            # CompanionService owns persona, memory, and mental-state prompt shaping.
+            async for chunk in self.companion_service.chat_stream(
+                user_id=user_id,
+                user_input=user_input,
             ):
                 # 步骤 6：解析 Chunk（提取任务、标记等）
                 events = parser.feed(chunk)

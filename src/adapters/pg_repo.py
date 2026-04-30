@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import declarative_base
 
 from src.core.exceptions.app_exception import AppException, ErrorCode
+from src.core.ports.memory_port import MemoryChunk, MemoryPort
 from src.core.ports.task_port import TaskPort
 from src.schemas.htn import HTNPlan, HTNTask, PlanStatus, TaskStatus
 
@@ -93,6 +94,199 @@ class OutboxModel(Base):
     payload = Column(JSON, nullable=False)
     processed = Column(Boolean, nullable=False, default=False, index=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class MemoryModel(Base):
+    __tablename__ = "memories"
+
+    id = Column(String(64), primary_key=True)
+    user_id = Column(String(255), nullable=False, index=True)
+    scope = Column(String(50), nullable=False, default="companion", index=True)
+    memory_type = Column(String(50), nullable=False, default="episode", index=True)
+    content = Column(String(4000), nullable=False)
+    importance = Column(Integer, nullable=False, default=50)
+    metadata_json = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class PGMemoryRepository(MemoryPort):
+    """Durable memory source of truth."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def query_context(
+        self,
+        query: str,
+        limit: int = 5,
+        filters: Optional[dict[str, Any]] = None,
+    ) -> list[MemoryChunk]:
+        del query
+        stmt = select(MemoryModel)
+        stmt = self._apply_filters(stmt, filters)
+        stmt = stmt.order_by(MemoryModel.importance.desc(), MemoryModel.updated_at.desc()).limit(limit)
+        result = await self.session.execute(stmt)
+        return [self._map_memory_model(row) for row in result.scalars().all()]
+
+    async def store(self, chunk: MemoryChunk) -> None:
+        await self.batch_store([chunk])
+
+    async def batch_store(self, chunks: list[MemoryChunk]) -> None:
+        if not chunks:
+            return
+        if self.session.in_transaction():
+            await self._upsert_chunks(chunks)
+            return
+        async with self.session.begin():
+            await self._upsert_chunks(chunks)
+
+    async def get_by_ids(
+        self,
+        ids: list[str],
+        filters: Optional[dict[str, Any]] = None,
+    ) -> list[MemoryChunk]:
+        if not ids:
+            return []
+        stmt = select(MemoryModel).where(MemoryModel.id.in_(ids))
+        stmt = self._apply_filters(stmt, filters)
+        result = await self.session.execute(stmt)
+        rows = list(result.scalars().all())
+        by_id = {str(row.id): self._map_memory_model(row) for row in rows}
+        return [by_id[memory_id] for memory_id in ids if memory_id in by_id]
+
+    async def _upsert_chunks(self, chunks: list[MemoryChunk]) -> None:
+        for chunk in chunks:
+            metadata = dict(chunk.metadata)
+            memory_id = str(metadata.get("id") or metadata.get("memory_id"))
+            if not memory_id:
+                raise AppException(
+                    code=ErrorCode.VALIDATION_ERROR,
+                    message="Memory chunk metadata must contain id before PG storage",
+                    recoverable=False,
+                )
+            now = datetime.utcnow()
+            metadata["id"] = memory_id
+            row = {
+                "id": memory_id,
+                "user_id": str(metadata.get("user_id", "")),
+                "scope": str(metadata.get("scope", "companion")),
+                "memory_type": str(metadata.get("memory_type", "episode")),
+                "content": chunk.content,
+                "importance": int(float(metadata.get("importance", 0.5)) * 100),
+                "metadata_json": metadata,
+                "updated_at": now,
+            }
+            stmt = select(MemoryModel).where(MemoryModel.id == memory_id)
+            existing = (await self.session.execute(stmt)).scalar_one_or_none()
+            if existing is None:
+                row["created_at"] = now
+                await self.session.execute(insert(MemoryModel).values(**row))
+            else:
+                await self.session.execute(
+                    update(MemoryModel).where(MemoryModel.id == memory_id).values(**row)
+                )
+
+    def _apply_filters(self, stmt, filters: Optional[dict[str, Any]]):
+        if not filters:
+            return stmt
+        if filters.get("user_id") is not None:
+            stmt = stmt.where(MemoryModel.user_id == str(filters["user_id"]))
+        if filters.get("scope") is not None:
+            stmt = stmt.where(MemoryModel.scope == str(filters["scope"]))
+        if filters.get("memory_type") is not None:
+            values = filters["memory_type"]
+            if isinstance(values, list):
+                stmt = stmt.where(MemoryModel.memory_type.in_([str(value) for value in values]))
+            else:
+                stmt = stmt.where(MemoryModel.memory_type == str(values))
+        return stmt
+
+    def _map_memory_model(self, model: MemoryModel) -> MemoryChunk:
+        metadata = dict(model.metadata_json or {})
+        metadata.setdefault("id", str(model.id))
+        metadata.setdefault("user_id", model.user_id)
+        metadata.setdefault("scope", model.scope)
+        metadata.setdefault("memory_type", model.memory_type)
+        metadata.setdefault("importance", model.importance / 100)
+        metadata.setdefault("created_at", model.created_at.isoformat() if model.created_at else None)
+        metadata.setdefault("updated_at", model.updated_at.isoformat() if model.updated_at else None)
+        return MemoryChunk(content=model.content, metadata=metadata, score=0.0)
+
+
+class PGBackedMemoryRepository(MemoryPort):
+    """Memory repository with PG as truth source and Chroma as retrieval index."""
+
+    def __init__(
+        self,
+        pg_repo: PGMemoryRepository,
+        vector_index: Optional[MemoryPort] = None,
+    ) -> None:
+        self.pg_repo = pg_repo
+        self.vector_index = vector_index
+
+    async def query_context(
+        self,
+        query: str,
+        limit: int = 5,
+        filters: Optional[dict[str, Any]] = None,
+    ) -> list[MemoryChunk]:
+        if self.vector_index is None:
+            return await self.pg_repo.query_context(query, limit=limit, filters=filters)
+
+        try:
+            indexed_chunks = await self.vector_index.query_context(
+                query=query,
+                limit=limit,
+                filters=filters,
+            )
+        except Exception as exc:
+            print(f"[WARNING] Chroma memory index query failed; falling back to PG: {exc}")
+            return await self.pg_repo.query_context(query, limit=limit, filters=filters)
+
+        ids = [
+            str(chunk.metadata.get("id") or chunk.metadata.get("memory_id"))
+            for chunk in indexed_chunks
+            if chunk.metadata.get("id") or chunk.metadata.get("memory_id")
+        ]
+        hydrated = await self.pg_repo.get_by_ids(ids, filters=filters)
+        scores_by_id = {
+            str(chunk.metadata.get("id") or chunk.metadata.get("memory_id")): chunk.score
+            for chunk in indexed_chunks
+        }
+        for chunk in hydrated:
+            memory_id = str(chunk.metadata.get("id") or chunk.metadata.get("memory_id"))
+            chunk.score = scores_by_id.get(memory_id, chunk.score)
+
+        if hydrated:
+            return hydrated[:limit]
+        return await self.pg_repo.query_context(query, limit=limit, filters=filters)
+
+    async def store(self, chunk: MemoryChunk) -> None:
+        await self.batch_store([chunk])
+
+    async def batch_store(self, chunks: list[MemoryChunk]) -> None:
+        normalized = [self._normalize_chunk(chunk) for chunk in chunks]
+        await self.pg_repo.batch_store(normalized)
+        if self.vector_index is None:
+            return
+        try:
+            await self.vector_index.batch_store(normalized)
+        except Exception as exc:
+            print(f"[WARNING] Chroma memory index upsert failed after PG write: {exc}")
+
+    def _normalize_chunk(self, chunk: MemoryChunk) -> MemoryChunk:
+        metadata = dict(chunk.metadata)
+        metadata["id"] = str(metadata.get("id") or metadata.get("memory_id") or uuid4())
+        metadata.setdefault("scope", "companion")
+        metadata.setdefault("memory_type", "episode")
+        metadata.setdefault("importance", 0.5)
+        return MemoryChunk(content=chunk.content, metadata=metadata, score=chunk.score)
 
 
 class PGTaskRepository(TaskPort):

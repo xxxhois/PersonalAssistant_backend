@@ -4,7 +4,10 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from src.main import app
-from src.routers.api_v1.dependencies import get_planning_service
+from src.routers.api_v1.dependencies import (
+    get_planning_service,
+    get_proactive_companion_service,
+)
 from src.schemas.planning import (
     ClarifyQuestion,
     DecomposeProgressEvent,
@@ -252,4 +255,53 @@ def test_planning_api_flow() -> None:
         assert task_response.status_code == 200
         assert task_response.json()["task"]["checked"] is True
 
+    app.dependency_overrides.clear()
+
+
+def test_chat_stream_rejects_planning_mode_without_loading_chat_dependencies() -> None:
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/chat/stream",
+            json={
+                "user_id": "user-1",
+                "user_message": "Help me decompose my graduation project.",
+                "mode": "planning",
+            },
+        )
+
+    assert response.status_code == 400
+    assert "planning mode is handled" in response.json()["detail"]
+
+
+class FakeProactiveCompanionService:
+    async def outreach_stream(self, user_id: str, trigger_reason: str):
+        del user_id, trigger_reason
+        yield "A small nudge from the office. "
+        yield "One step is enough."
+
+
+def test_proactive_companion_stream() -> None:
+    app.dependency_overrides[get_proactive_companion_service] = (
+        lambda: FakeProactiveCompanionService()
+    )
+
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            "/api/v1/companion/proactive/stream",
+            json={
+                "user_id": "user-1",
+                "trigger_reason": "scheduled morning check-in",
+            },
+        ) as stream_response:
+            assert stream_response.status_code == 200
+            frames = [
+                json.loads(line.removeprefix("data: "))
+                for line in stream_response.iter_lines()
+                if line.startswith("data: ")
+            ]
+
+    assert frames[0]["event"] == "token"
+    assert frames[0]["data"]["token"].startswith("A small nudge")
+    assert frames[-1]["event"] == "done"
     app.dependency_overrides.clear()

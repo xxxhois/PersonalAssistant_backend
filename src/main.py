@@ -5,7 +5,9 @@ from fastapi.responses import JSONResponse
 
 from src.core.exceptions.app_exception import AppException, ErrorCode
 from src.routers.api_v1.chat import router as chat_router
+from src.routers.api_v1.companion import router as companion_router
 from src.routers.api_v1.planning import router as planning_router
+from src.routers.streams.chat import router as legacy_streams_router
 from src.schemas.common import ErrorResponse
 
 
@@ -43,7 +45,9 @@ def create_app() -> FastAPI:
         return {"status": "ok", "version": "0.1.0"}
 
     app.include_router(chat_router)
+    app.include_router(companion_router)
     app.include_router(planning_router)
+    app.include_router(legacy_streams_router)
     return app
 
 
