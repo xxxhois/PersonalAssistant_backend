@@ -35,6 +35,9 @@ backend/
 │   └── integration/         # 集成测试
 └── docs/                    # 架构与开发文档
 └── agents/              # AI Agent 专属约束文档
+```
+
+
 
 ```mermaid
 graph TD
@@ -54,9 +57,3 @@ G -- "EventSourceResponse" --> H[Client]
 I[AppException] -- "Global Exception Handler" --> J["SSE Event: error (recoverable=bool)"]
 J --> G
 ```
-
-```
-
-```
-
-ShadowParser Logic
