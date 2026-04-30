@@ -1,3 +1,4 @@
+```
 backend/
 ├── .env.example             # 环境变量模版（含 LLM\_PROVIDER, DB\_URL 等）
 ├── .gitignore               # Python/Docker/IDE 忽略项
@@ -54,3 +55,8 @@ I[AppException] -- "Global Exception Handler" --> J["SSE Event: error (recoverab
 J --> G
 ```
 
+```
+
+```
+
+ShadowParser Logic

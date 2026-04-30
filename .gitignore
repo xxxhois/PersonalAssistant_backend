@@ -26,6 +26,7 @@ wheels/
 .idea/
 *.swp
 *.swo
+.trae/
 
 # Environment
 .env
