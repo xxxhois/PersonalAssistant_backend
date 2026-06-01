@@ -13,6 +13,7 @@ from src.schemas.planning import (
     GoalInitRequest,
     PlanConfirmRequest,
     PlanStartRequest,
+    PlanTaskDecomposeRequest,
     TaskUpdateRequest,
 )
 from src.schemas.sse import SSEEventType, SSEFrame
@@ -44,6 +45,74 @@ async def stream_planning(
         seq = 0
         try:
             async for item in planning_service.stream_plan(request):
+                seq += 1
+                if isinstance(item, DecomposeProgressEvent):
+                    frame = SSEFrame(
+                        id=f"progress_{seq}",
+                        event=SSEEventType.PROGRESS,
+                        data=item.model_dump(),
+                        request_id=request_id,
+                        seq=seq,
+                    )
+                else:
+                    frame = SSEFrame(
+                        id=f"done_{seq}",
+                        event=SSEEventType.DONE,
+                        data={"plan": item.model_dump(mode="json")},
+                        request_id=request_id,
+                        seq=seq,
+                    )
+                yield _frame_to_sse(frame)
+        except AppException as exc:
+            seq += 1
+            yield _frame_to_sse(
+                SSEFrame(
+                    id=f"error_{seq}",
+                    event=SSEEventType.ERROR,
+                    data={
+                        "code": exc.code.value,
+                        "message": exc.message,
+                        "details": exc.details,
+                    },
+                    request_id=request_id,
+                    seq=seq,
+                    recoverable=exc.recoverable,
+                )
+            )
+        except Exception as exc:
+            seq += 1
+            yield _frame_to_sse(
+                SSEFrame(
+                    id=f"error_{seq}",
+                    event=SSEEventType.ERROR,
+                    data={
+                        "code": ErrorCode.INTERNAL_ERROR.value,
+                        "message": str(exc),
+                    },
+                    request_id=request_id,
+                    seq=seq,
+                    recoverable=False,
+                )
+            )
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+@router.post("/decompose-task/stream")
+async def stream_task_decomposition(
+    request: PlanTaskDecomposeRequest,
+    planning_service: PlanningService = Depends(get_planning_service),
+):
+    request_id = str(uuid.uuid4())
+
+    async def event_generator() -> AsyncIterator[str]:
+        seq = 0
+        try:
+            async for item in planning_service.stream_task_decomposition(request):
                 seq += 1
                 if isinstance(item, DecomposeProgressEvent):
                     frame = SSEFrame(

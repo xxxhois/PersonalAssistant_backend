@@ -47,7 +47,11 @@ async def test_orchestrator_chat_stream_flow():
 
     request_id = "test_req_123"
     frames = []
-    async for frame in orchestrator.chat_stream("user_1", "Hello!", request_id):
+    async for frame in orchestrator.chat_stream(
+        "user_1",
+        "What did we discuss before about my project planning preference?",
+        request_id,
+    ):
         frames.append(frame)
 
     event_types = [f.event for f in frames]
@@ -63,7 +67,7 @@ async def test_orchestrator_chat_stream_flow():
     assert seqs == sorted(seqs)
     assert len(set(seqs)) == len(seqs)
 
-    memory_port.query_context.assert_called_once()
+    assert memory_port.query_context.await_count >= 1
 
     chat_requests = [
         request

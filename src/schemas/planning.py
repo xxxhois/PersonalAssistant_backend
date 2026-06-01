@@ -46,6 +46,13 @@ class PlanStartRequest(BaseModel):
     answers: List[QuestionAnswer] = Field(..., min_length=1)
 
 
+class PlanTaskDecomposeRequest(BaseModel):
+    session_id: str
+    user_id: str
+    task_id: str = Field(..., description="Coarse task id returned by PlanResult")
+    plan_id: Optional[str] = Field(default=None, description="Persisted plan id for continuing decomposition")
+
+
 class DecomposeProgressEvent(BaseModel):
     depth: int = Field(..., description="Current decomposition depth")
     message: str = Field(..., description="One-line progress update")
@@ -56,12 +63,15 @@ class AtomicTaskItem(BaseModel):
     task_id: str = Field(default_factory=lambda: str(uuid4()))
     title: str
     description: str = ""
-    estimated_duration_minutes: int = Field(..., ge=5, le=480)
+    estimated_duration_minutes: int = Field(..., ge=5, le=10080)
     scheduled_date: Optional[str] = Field(default=None, description="YYYY-MM-DD")
     scheduled_time: Optional[str] = Field(default=None, description="09:00-10:30")
     order: int
     parent_goal: str = ""
     checked: bool = False
+    task_type: str = Field(default="atomic", description="atomic or container")
+    can_decompose: bool = False
+    decomposition_ref: Optional[str] = None
 
 
 class PlanResult(BaseModel):
@@ -90,6 +100,10 @@ class PersistedTaskResponse(BaseModel):
     order: int
     parent_goal: str = ""
     checked: bool = False
+    task_type: str = "atomic"
+    can_decompose: bool = False
+    decomposition_ref: Optional[str] = None
+    subtasks: List["PersistedTaskResponse"] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
@@ -148,3 +162,4 @@ class TaskUpdateResponse(BaseModel):
 class PlanDeleteResponse(BaseModel):
     message: str = Field(default="计划已删除")
     plan_id: str
+PersistedTaskResponse.model_rebuild()

@@ -24,6 +24,14 @@ class TaskPort(Protocol):
     async def save_plan(self, plan: HTNPlan) -> None:
         ...
 
+    async def replace_task_subtree(
+        self,
+        plan_id: UUID,
+        task_id: UUID,
+        subtasks: list[HTNTask],
+    ) -> None:
+        ...
+
     async def get_plan(self, plan_id: UUID) -> HTNPlan:
         ...
 

@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, Optional
 from uuid import UUID
 
@@ -44,7 +44,7 @@ class InMemoryTaskRepository(TaskPort):
         )
 
     async def save_plan(self, plan: HTNPlan) -> None:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         stored_plan = plan.model_copy(
             update={
                 "created_at": plan.created_at or now,
@@ -54,6 +54,41 @@ class InMemoryTaskRepository(TaskPort):
         self._plans[str(plan.plan_id)] = stored_plan
         for task in stored_plan.tasks:
             self._store_task_tree(task, str(stored_plan.plan_id))
+
+    async def replace_task_subtree(
+        self,
+        plan_id: UUID,
+        task_id: UUID,
+        subtasks: list[HTNTask],
+    ) -> None:
+        plan_key = str(plan_id)
+        plan = self._plans.get(plan_key)
+        if plan is None:
+            raise AppException(
+                code=ErrorCode.NOT_FOUND,
+                message=f"Plan {plan_id} not found",
+                recoverable=False,
+            )
+
+        updated_tasks = self._replace_subtree_in_forest(plan.tasks, task_id, subtasks)
+        if updated_tasks is None:
+            raise AppException(
+                code=ErrorCode.NOT_FOUND,
+                message=f"Task {task_id} not found in plan {plan_id}",
+                recoverable=False,
+            )
+
+        updated_plan = plan.model_copy(
+            update={"tasks": updated_tasks, "updated_at": datetime.now(timezone.utc)}
+        )
+        self._plans[plan_key] = updated_plan
+        self._tasks = {
+            stored_id: stored_task
+            for stored_id, stored_task in self._tasks.items()
+            if stored_task.metadata.get("plan_id") != plan_key
+        }
+        for task in updated_plan.tasks:
+            self._store_task_tree(task, plan_key)
 
     async def get_plan(self, plan_id: UUID) -> HTNPlan:
         plan = self._plans.get(str(plan_id))
@@ -112,6 +147,27 @@ class InMemoryTaskRepository(TaskPort):
         self._tasks[task.id] = task
         for subtask in task.subtasks:
             self._store_task_tree(subtask, plan_id)
+
+    def _replace_subtree_in_forest(
+        self,
+        tasks: list[HTNTask],
+        task_id: UUID,
+        subtasks: list[HTNTask],
+    ) -> Optional[list[HTNTask]]:
+        updated: list[HTNTask] = []
+        found = False
+        for task in tasks:
+            if task.id == task_id:
+                found = True
+                updated.append(task.model_copy(update={"subtasks": subtasks}))
+                continue
+            child_result = self._replace_subtree_in_forest(task.subtasks, task_id, subtasks)
+            if child_result is not None:
+                found = True
+                updated.append(task.model_copy(update={"subtasks": child_result}))
+            else:
+                updated.append(task)
+        return updated if found else None
 
     def _delete_task_tree(self, task: HTNTask) -> None:
         self._tasks.pop(task.id, None)

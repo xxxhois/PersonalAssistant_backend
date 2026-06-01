@@ -38,6 +38,7 @@ ENV/
 logs/
 *.log
 .chroma/
+.chroma-cache/
 data/
 
 # OS

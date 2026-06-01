@@ -44,6 +44,7 @@ class Orchestrator:
         self.companion_service = CompanionService(
             llm_client=self.llm_client,
             memory_port=memory_port,
+            task_port=task_port,
         )
 
     async def chat_stream(

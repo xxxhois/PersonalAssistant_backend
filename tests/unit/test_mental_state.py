@@ -6,4 +6,5 @@ def test_mental_state_detects_low_energy_chinese_input() -> None:
 
     assert snapshot.state == MentalState.LOW_ENERGY
     assert snapshot.confidence > 0.5
+    assert snapshot.response_strategy == "low_friction_action"
     assert any("smallest useful action" in item for item in snapshot.prompt_constraints)

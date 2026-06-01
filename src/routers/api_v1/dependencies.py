@@ -76,7 +76,7 @@ def get_orchestrator(
 def build_companion_orchestrator(
     session: AsyncSession | None = None,
 ) -> Orchestrator:
-    """Build chat orchestrator without touching planning persistence."""
+    """Build chat orchestrator with memory and active-plan context."""
     llm_port = llm_router.get_provider()
     backend = os.getenv("MEMORY_BACKEND", "in_memory").lower()
     if backend in {"chroma", "pg"}:
@@ -95,9 +95,10 @@ def build_companion_orchestrator(
         )
     else:
         memory_repo = _memory_repo
+    task_repo = PGTaskRepository(session=session) if session is not None else _chat_task_repo
     return Orchestrator(
         llm_port=llm_port,
-        task_port=_chat_task_repo,
+        task_port=task_repo,
         memory_port=memory_repo,
     )
 

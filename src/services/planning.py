@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from math import ceil
 from typing import AsyncIterator, Dict, List, Optional
 from uuid import UUID, uuid4
@@ -21,6 +21,7 @@ from src.schemas.planning import (
     PlanListItemResponse,
     PlanListResponse,
     PlanResult,
+    PlanTaskDecomposeRequest,
     PlanStartRequest,
     QuestionAnswer,
     TaskUpdateRequest,
@@ -38,6 +39,10 @@ class PlanningSession:
     questions_by_id: Dict[str, Dict[str, object]]
     answer_map: Dict[str, List[str]] = field(default_factory=dict)
     plan_result: Optional[PlanResult] = None
+    root_tasks: List[AtomicTaskItem] = field(default_factory=list)
+    child_tasks_by_parent_id: Dict[str, List[AtomicTaskItem]] = field(default_factory=dict)
+    coarse_tasks_by_id: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    clarify_context: str = ""
 
 
 class PlanningSessionStore:
@@ -136,121 +141,179 @@ class PlanningService:
         yield DecomposeProgressEvent(
             depth=1,
             message=str(
-                high_level_payload.get("progress_message", "已完成目标的阶段拆分。")
+                high_level_payload.get(
+                    "progress_message",
+                    "???????????????????????????",
+                )
             ),
             subtask_count=len(milestones),
         )
 
+        coarse_items: List[AtomicTaskItem] = []
+        coarse_tasks_by_id: Dict[str, Dict[str, object]] = {}
+        for milestone_index, milestone in enumerate(milestones, start=1):
+            task_id = str(uuid4())
+            estimated_days = int(milestone.get("estimated_days", 7) or 7)
+            estimated_minutes = self._bound_task_duration_minutes(estimated_days * 24 * 60)
+            item = AtomicTaskItem(
+                task_id=task_id,
+                title=str(milestone.get("title", f"Phase {milestone_index}")),
+                description=str(milestone.get("description", "")),
+                estimated_duration_minutes=estimated_minutes,
+                scheduled_date=None,
+                scheduled_time=None,
+                order=milestone_index,
+                parent_goal=session.goal_summary,
+                task_type="container",
+                can_decompose=True,
+                decomposition_ref=task_id,
+            )
+            coarse_items.append(item)
+            coarse_tasks_by_id[task_id] = {
+                "title": item.title,
+                "description": item.description,
+                "estimated_days": estimated_days,
+                "order": milestone_index,
+            }
+
+        session.root_tasks = coarse_items
+        session.child_tasks_by_parent_id = {}
+        session.plan_result = self._build_current_plan_result(session)
+        session.coarse_tasks_by_id = coarse_tasks_by_id
+        session.clarify_context = clarify_context
+        self.session_store.save(session)
+        yield session.plan_result
+
+    async def stream_task_decomposition(
+        self,
+        request: PlanTaskDecomposeRequest,
+    ) -> AsyncIterator[DecomposeProgressEvent | PlanResult]:
+        session = self.session_store.get(request.session_id)
+        if session.user_id != request.user_id:
+            raise AppException(
+                code=ErrorCode.FORBIDDEN,
+                message="Planning session does not belong to this user",
+                recoverable=False,
+            )
+
+        persisted_plan: Optional[HTNPlan] = None
+        if request.plan_id:
+            persisted_plan = await self.task_port.get_plan(UUID(request.plan_id))
+            persisted_user_id = str((persisted_plan.model_extra or {}).get("user_id", ""))
+            if persisted_user_id != request.user_id:
+                raise AppException(
+                    code=ErrorCode.FORBIDDEN,
+                    message="Persisted plan does not belong to this user",
+                    recoverable=False,
+                )
+
+        target_task = self._find_task_snapshot(session, request.task_id)
+        if target_task is None and persisted_plan is not None:
+            target_task = self._find_htn_task_snapshot(persisted_plan.tasks, request.task_id)
+        if target_task is None:
+            raise AppException(
+                code=ErrorCode.NOT_FOUND,
+                message=f"Planning task {request.task_id} not found",
+                recoverable=False,
+            )
+        if not target_task.can_decompose:
+            raise AppException(
+                code=ErrorCode.VALIDATION_ERROR,
+                message="Selected task cannot be decomposed further",
+                recoverable=False,
+            )
+
+        mid_level_payload = await self.llm_client.generate_json(
+            prompt=PlanningPrompts.build_mid_level_decompose_prompt(
+                goal_description=session.goal_description,
+                milestone_title=target_task.title,
+                milestone_description=target_task.description,
+                clarify_context=session.clarify_context,
+            ),
+            system_prompt=PlanningPrompts.get_planning_system_prompt(),
+            temperature=0.4,
+            max_tokens=1400,
+        )
+        tasks = mid_level_payload.get("tasks", [])
+        yield DecomposeProgressEvent(
+            depth=2,
+            message=str(mid_level_payload.get("progress_message", "?????????")),
+            subtask_count=len(tasks),
+        )
+
         day_cursor = date.today()
         budget_minutes = self._infer_daily_budget_minutes(session)
-        atomic_items: List[AtomicTaskItem] = []
-        global_order = 1
-
-        for milestone_index, milestone in enumerate(milestones, start=1):
-            mid_level_payload = await self.llm_client.generate_json(
-                prompt=PlanningPrompts.build_mid_level_decompose_prompt(
-                    goal_description=session.goal_description,
-                    milestone_title=str(milestone.get("title", f"阶段 {milestone_index}")),
-                    milestone_description=str(milestone.get("description", "")),
-                    clarify_context=clarify_context,
-                ),
-                system_prompt=PlanningPrompts.get_planning_system_prompt(),
-                temperature=0.4,
-                max_tokens=1400,
-            )
-            tasks = mid_level_payload.get("tasks", [])
-            yield DecomposeProgressEvent(
-                depth=2,
-                message=str(
-                    mid_level_payload.get(
-                        "progress_message",
-                        f"已细化阶段 {milestone_index} 的具体任务。",
-                    )
-                ),
-                subtask_count=len(tasks),
-            )
-
-            for task in tasks:
-                estimated_hours = float(task.get("estimated_hours", 2))
-                if estimated_hours <= 2:
-                    schedule = self._schedule_atomic_task(
-                        day_cursor=day_cursor,
-                        duration_minutes=max(30, int(estimated_hours * 60)),
-                        daily_budget_minutes=budget_minutes,
-                    )
-                    day_cursor = schedule["day_cursor"]
-                    atomic_items.append(
-                        AtomicTaskItem(
-                            title=str(task.get("title", "未命名任务")),
-                            description=str(task.get("description", "")),
-                            estimated_duration_minutes=int(schedule["duration_minutes"]),
-                            scheduled_date=str(schedule["scheduled_date"]),
-                            scheduled_time=str(schedule["scheduled_time"]),
-                            order=global_order,
-                            parent_goal=str(milestone.get("title", "")),
-                        )
-                    )
-                    global_order += 1
-                    continue
-
-                atomic_payload = await self.llm_client.generate_json(
-                    prompt=PlanningPrompts.build_atomic_decompose_prompt(
-                        goal_description=session.goal_description,
-                        task_title=str(task.get("title", "未命名任务")),
-                        task_description=str(task.get("description", "")),
-                        estimated_hours=estimated_hours,
-                        clarify_context=clarify_context,
-                    ),
-                    system_prompt=PlanningPrompts.get_planning_system_prompt(),
-                    temperature=0.4,
-                    max_tokens=1600,
+        items: List[AtomicTaskItem] = []
+        for index, task in enumerate(tasks, start=1):
+            estimated_hours = float(task.get("estimated_hours", 2))
+            task_id = str(uuid4())
+            if estimated_hours <= 2:
+                schedule = self._schedule_atomic_task(
+                    day_cursor=day_cursor,
+                    duration_minutes=max(30, int(estimated_hours * 60)),
+                    daily_budget_minutes=budget_minutes,
                 )
-                generated_atomic_tasks = atomic_payload.get("atomic_tasks", [])
-                yield DecomposeProgressEvent(
-                    depth=3,
-                    message=str(
-                        atomic_payload.get(
-                            "progress_message",
-                            f"已将任务 {task.get('title', '未命名任务')} 细化为原子步骤。",
-                        )
-                    ),
-                    subtask_count=len(generated_atomic_tasks),
+                day_cursor = schedule["day_cursor"]
+                items.append(
+                    AtomicTaskItem(
+                        task_id=task_id,
+                        title=str(task.get("title", "Unnamed task")),
+                        description=str(task.get("description", "")),
+                        estimated_duration_minutes=int(schedule["duration_minutes"]),
+                        scheduled_date=str(schedule["scheduled_date"]),
+                        scheduled_time=str(schedule["scheduled_time"]),
+                        order=index,
+                        parent_goal=target_task.title,
+                        task_type="atomic",
+                        can_decompose=False,
+                    )
+                )
+            else:
+                items.append(
+                    AtomicTaskItem(
+                        task_id=task_id,
+                        title=str(task.get("title", "Unnamed long task")),
+                        description=str(task.get("description", "")),
+                        estimated_duration_minutes=self._bound_task_duration_minutes(
+                            max(120, int(estimated_hours * 60))
+                        ),
+                        scheduled_date=None,
+                        scheduled_time=None,
+                        order=index,
+                        parent_goal=target_task.title,
+                        task_type="container",
+                        can_decompose=True,
+                        decomposition_ref=task_id,
+                    )
                 )
 
-                for atomic_task in generated_atomic_tasks:
-                    duration_minutes = int(
-                        atomic_task.get("estimated_duration_minutes", 60)
-                    )
-                    schedule = self._schedule_atomic_task(
-                        day_cursor=day_cursor,
-                        duration_minutes=duration_minutes,
-                        daily_budget_minutes=budget_minutes,
-                        preferred_slot=atomic_task.get("suggested_time_slot"),
-                    )
-                    day_cursor = schedule["day_cursor"]
-                    atomic_items.append(
-                        AtomicTaskItem(
-                            title=str(atomic_task.get("title", "未命名原子任务")),
-                            description=str(atomic_task.get("description", "")),
-                            estimated_duration_minutes=int(schedule["duration_minutes"]),
-                            scheduled_date=str(schedule["scheduled_date"]),
-                            scheduled_time=str(schedule["scheduled_time"]),
-                            order=global_order,
-                            parent_goal=str(milestone.get("title", "")),
-                        )
-                    )
-                    global_order += 1
-
-        total_minutes = sum(item.estimated_duration_minutes for item in atomic_items)
+        total_minutes = sum(item.estimated_duration_minutes for item in items)
         result = PlanResult(
             session_id=session.session_id,
-            goal_summary=session.goal_summary,
-            total_tasks=len(atomic_items),
+            goal_summary=f"{session.goal_summary} / {target_task.title}",
+            total_tasks=len(items),
             total_estimated_hours=round(total_minutes / 60, 1),
-            tasks=atomic_items,
+            tasks=items,
         )
-        session.plan_result = result
+        session.child_tasks_by_parent_id[request.task_id] = items
+        session.plan_result = self._build_current_plan_result(session)
         self.session_store.save(session)
+        if request.plan_id and persisted_plan is not None:
+            await self.task_port.replace_task_subtree(
+                plan_id=UUID(request.plan_id),
+                task_id=UUID(request.task_id),
+                subtasks=[
+                    HTNTask(
+                        id=UUID(item.task_id),
+                        title=item.title,
+                        description=item.description,
+                        status=TaskStatus.PENDING,
+                        subtasks=[],
+                        metadata=self._task_metadata(item, checked=item.checked),
+                    )
+                    for item in items
+                ],
+            )
         yield result
 
     async def confirm_plan(self, request: PlanConfirmRequest) -> PlanConfirmResponse:
@@ -269,9 +332,7 @@ class PlanningService:
             )
 
         confirmed_set = set(request.confirmed_task_ids)
-        confirmed_tasks = [
-            task for task in session.plan_result.tasks if task.task_id in confirmed_set
-        ]
+        confirmed_tasks = self._build_confirmed_task_forest(session, confirmed_set)
         if not confirmed_tasks:
             raise AppException(
                 code=ErrorCode.VALIDATION_ERROR,
@@ -280,26 +341,8 @@ class PlanningService:
             )
 
         plan_id = uuid4()
-        now = datetime.utcnow()
-        htn_tasks = [
-            HTNTask(
-                id=UUID(task.task_id),
-                title=task.title,
-                description=task.description,
-                status=TaskStatus.PENDING,
-                metadata={
-                    "estimated_duration_minutes": task.estimated_duration_minutes,
-                    "scheduled_date": task.scheduled_date,
-                    "scheduled_time": task.scheduled_time,
-                    "order": task.order,
-                    "parent_goal": task.parent_goal,
-                    "checked": True,
-                    "created_at": now.isoformat(),
-                    "updated_at": now.isoformat(),
-                },
-            )
-            for task in confirmed_tasks
-        ]
+        now = datetime.now(timezone.utc)
+        htn_tasks = confirmed_tasks
         plan = HTNPlan(
             plan_id=plan_id,
             goal=session.goal_description,
@@ -319,7 +362,7 @@ class PlanningService:
         persisted_plan = self._to_persisted_plan_response(saved_plan)
         return PlanConfirmResponse(
             plan_id=str(plan_id),
-            confirmed_count=len(confirmed_tasks),
+            confirmed_count=len(confirmed_set),
             message="任务计划已保存",
             plan=persisted_plan,
         )
@@ -375,7 +418,7 @@ class PlanningService:
             status = TaskStatus.COMPLETED if checked else TaskStatus.PENDING
 
         metadata["checked"] = checked
-        metadata["updated_at"] = datetime.utcnow().isoformat()
+        metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
 
         async with self.task_port.within_transaction():
             await self.task_port.update_task_status(task_id, status=status, metadata=metadata)
@@ -504,7 +547,7 @@ class PlanningService:
         task: HTNTask,
     ) -> PersistedTaskResponse:
         metadata = dict(task.metadata)
-        created_at = self._parse_datetime(metadata.get("created_at")) or datetime.utcnow()
+        created_at = self._parse_datetime(metadata.get("created_at")) or datetime.now(timezone.utc)
         updated_at = self._parse_datetime(metadata.get("updated_at")) or created_at
         return PersistedTaskResponse(
             task_id=str(task.id),
@@ -520,6 +563,13 @@ class PlanningService:
             order=int(metadata.get("order", 1)),
             parent_goal=str(metadata.get("parent_goal", "")),
             checked=bool(metadata.get("checked", False)),
+            task_type=str(metadata.get("task_type", "atomic")),
+            can_decompose=bool(metadata.get("can_decompose", False)),
+            decomposition_ref=metadata.get("decomposition_ref"),
+            subtasks=[
+                self._to_persisted_task_response(plan_id, subtask)
+                for subtask in task.subtasks
+            ],
             created_at=created_at,
             updated_at=updated_at,
         )
@@ -535,8 +585,120 @@ class PlanningService:
                 code=ErrorCode.INTERNAL_ERROR,
                 message=f"Persisted task {task.id} is missing plan_id metadata",
                 recoverable=False,
-            )
+        )
         return self._to_persisted_task_response(UUID(str(plan_id)), task)
+
+    def _build_current_plan_result(self, session: PlanningSession) -> PlanResult:
+        flat_tasks: List[AtomicTaskItem] = []
+
+        def visit(task: AtomicTaskItem) -> None:
+            flat_tasks.append(task)
+            for child in session.child_tasks_by_parent_id.get(task.task_id, []):
+                visit(child)
+
+        for root_task in session.root_tasks:
+            visit(root_task)
+
+        total_minutes = sum(task.estimated_duration_minutes for task in flat_tasks)
+        return PlanResult(
+            session_id=session.session_id,
+            goal_summary=session.goal_summary,
+            total_tasks=len(flat_tasks),
+            total_estimated_hours=round(total_minutes / 60, 1),
+            tasks=flat_tasks,
+        )
+
+    def _bound_task_duration_minutes(self, minutes: int) -> int:
+        return max(60, min(minutes, 10080))
+
+    def _build_confirmed_task_forest(
+        self,
+        session: PlanningSession,
+        confirmed_set: set[str],
+    ) -> List[HTNTask]:
+        def build(task: AtomicTaskItem) -> Optional[HTNTask]:
+            child_nodes: List[HTNTask] = []
+            for child in session.child_tasks_by_parent_id.get(task.task_id, []):
+                built_child = build(child)
+                if built_child is not None:
+                    child_nodes.append(built_child)
+
+            if task.task_id not in confirmed_set and not child_nodes:
+                return None
+
+            return HTNTask(
+                id=UUID(task.task_id),
+                title=task.title,
+                description=task.description,
+                status=TaskStatus.PENDING,
+                subtasks=child_nodes,
+                metadata=self._task_metadata(task, checked=task.task_id in confirmed_set),
+            )
+
+        forest: List[HTNTask] = []
+        for root_task in session.root_tasks:
+            built_task = build(root_task)
+            if built_task is not None:
+                forest.append(built_task)
+        return forest
+
+    def _task_metadata(self, task: AtomicTaskItem, checked: bool) -> Dict[str, object]:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        return {
+            "estimated_duration_minutes": task.estimated_duration_minutes,
+            "scheduled_date": task.scheduled_date,
+            "scheduled_time": task.scheduled_time,
+            "order": task.order,
+            "parent_goal": task.parent_goal,
+            "checked": checked,
+            "task_type": task.task_type,
+            "can_decompose": task.can_decompose,
+            "decomposition_ref": task.decomposition_ref,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+        }
+
+    def _find_task_snapshot(
+        self,
+        session: PlanningSession,
+        task_id: str,
+    ) -> Optional[AtomicTaskItem]:
+        if session.plan_result is not None:
+            for task in session.plan_result.tasks:
+                if task.task_id == task_id:
+                    return task
+        for task in session.root_tasks:
+            found = self._find_task_snapshot_in_tree(task, session.child_tasks_by_parent_id, task_id)
+            if found is not None:
+                return found
+        return None
+
+    def _find_task_snapshot_in_tree(
+        self,
+        task: AtomicTaskItem,
+        child_tasks_by_parent_id: Dict[str, List[AtomicTaskItem]],
+        task_id: str,
+    ) -> Optional[AtomicTaskItem]:
+        if task.task_id == task_id:
+            return task
+        for child in child_tasks_by_parent_id.get(task.task_id, []):
+            found = self._find_task_snapshot_in_tree(child, child_tasks_by_parent_id, task_id)
+            if found is not None:
+                return found
+        return None
+
+    def _find_htn_task_snapshot(
+        self,
+        tasks: List[HTNTask],
+        task_id: str,
+    ) -> Optional[HTNTask]:
+        for task in tasks:
+            if str(task.id) == task_id:
+                return task
+            found = self._find_htn_task_snapshot(task.subtasks, task_id)
+            if found is not None:
+                return found
+        return None
 
     def _parse_datetime(self, value: object) -> Optional[datetime]:
         if value in (None, ""):

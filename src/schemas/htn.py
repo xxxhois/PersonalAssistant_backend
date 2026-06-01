@@ -3,10 +3,14 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 from uuid import UUID
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Keep this permissive to avoid recursive schema expansion issues in Pydantic v2.
 JsonValue = Any
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 class TaskStatus(str, Enum):
     """HTN 任务状态枚举"""
@@ -49,5 +53,5 @@ class HTNPlan(BaseModel):
     goal: str = Field(..., description="宏大目标原始描述")
     tasks: List[HTNTask] = Field(..., description="分解后的原子任务树")
     status: PlanStatus = Field(default=PlanStatus.ACTIVE)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)

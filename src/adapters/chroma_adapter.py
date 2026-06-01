@@ -1,8 +1,12 @@
 import asyncio
+import os
+from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
 from src.core.ports.memory_port import MemoryChunk, MemoryPort
+
+ChromaScalar = str | int | float | bool
 
 
 class ChromaAdapter(MemoryPort):
@@ -36,7 +40,7 @@ class ChromaAdapter(MemoryPort):
             collection.query,
             query_texts=[query],
             n_results=limit,
-            where=filters,
+            where=self._build_where(filters),
         )
         documents = (result.get("documents") or [[]])[0]
         metadatas = (result.get("metadatas") or [[]])[0]
@@ -72,7 +76,7 @@ class ChromaAdapter(MemoryPort):
             metadata["id"] = document_id
             ids.append(document_id)
             documents.append(chunk.content)
-            metadatas.append(metadata)
+            metadatas.append(self._sanitize_metadata(metadata))
 
         await asyncio.to_thread(
             collection.upsert,
@@ -87,9 +91,55 @@ class ChromaAdapter(MemoryPort):
 
         def connect() -> Any:
             import chromadb
+            from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import (
+                ONNXMiniLM_L6_V2,
+            )
+
+            model_path = os.getenv(
+                "CHROMA_ONNX_MODEL_PATH",
+                str(Path.cwd() / ".chroma-cache" / "onnx_models" / ONNXMiniLM_L6_V2.MODEL_NAME),
+            )
+            ONNXMiniLM_L6_V2.DOWNLOAD_PATH = Path(model_path)
+            embedding_function = ONNXMiniLM_L6_V2()
 
             client = chromadb.HttpClient(host=self.host, port=self.port)
-            return client.get_or_create_collection(name=self.collection_name)
+            return client.get_or_create_collection(
+                name=self.collection_name,
+                embedding_function=embedding_function,
+            )
 
         self._collection = await asyncio.to_thread(connect)
         return self._collection
+
+    def _sanitize_metadata(self, metadata: dict[str, Any]) -> dict[str, ChromaScalar]:
+        """Chroma metadata accepts only scalar values; PG keeps the full metadata."""
+        sanitized: dict[str, ChromaScalar] = {}
+        for key, value in metadata.items():
+            if value is None:
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                sanitized[str(key)] = value
+            else:
+                sanitized[str(key)] = str(value)
+        return sanitized
+
+    def _build_where(self, filters: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not filters:
+            return None
+
+        clauses: list[dict[str, Any]] = []
+        for key, value in filters.items():
+            if value is None:
+                continue
+            if isinstance(value, list):
+                scalar_values = [item for item in value if isinstance(item, (str, int, float, bool))]
+                if scalar_values:
+                    clauses.append({str(key): {"$in": scalar_values}})
+            elif isinstance(value, (str, int, float, bool)):
+                clauses.append({str(key): {"$eq": value}})
+
+        if not clauses:
+            return None
+        if len(clauses) == 1:
+            return clauses[0]
+        return {"$and": clauses}
